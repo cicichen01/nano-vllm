@@ -42,6 +42,7 @@ FA_VER="${FA_VER:-2.7.4.post1}"
 FA_ARCHS="${FA_ARCHS:-90}"            # 90=H100 only; use "80;90" for A100+H100
 MAX_JOBS="${MAX_JOBS:-64}"
 REPO_DIR="${REPO_DIR:-/home/cicichen/nano-vllm}"
+TEST_SCRIPT="${TEST_SCRIPT:-$REPO_DIR/h100_setup/test_h100.py}"   # this script + test live under h100_setup/
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-0.6B}"
 MODEL_DIR="${MODEL_DIR:-$HOME/huggingface/$(basename "$MODEL_ID")}"
 CONDA="${CONDA:-/usr/bin/conda}"     # real binary; conda shell fn isn't loaded non-interactively
@@ -114,10 +115,10 @@ echo "== 8. download model: $MODEL_ID -> $MODEL_DIR  (Xet CDN is blocked -> disa
 HF_HUB_DISABLE_XET=1 "$ENV_PREFIX/bin/hf" download "$MODEL_ID" --local-dir "$MODEL_DIR"
 
 echo "== 9. smoke test =="
-MODEL="$MODEL_DIR" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" env -u PYTHONPATH "$PY" "$REPO_DIR/test_h100.py"
+MODEL="$MODEL_DIR" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" env -u PYTHONPATH "$PY" "$TEST_SCRIPT"
 
 echo
 echo "== DONE =="
 echo "To run later, FIRST export the runtime lib path:"
 echo "  export LD_LIBRARY_PATH=$ENV_PREFIX/targets/x86_64-linux/lib:$ENV_PREFIX/lib"
-echo "  MODEL=$MODEL_DIR $PY $REPO_DIR/test_h100.py"
+echo "  MODEL=$MODEL_DIR $PY $TEST_SCRIPT"
