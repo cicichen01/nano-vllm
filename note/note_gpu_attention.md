@@ -193,3 +193,120 @@ ncu --set basic --target-processes all -k regex:"gemm|elementwise" \
 Rule confirmed: the throughput near 100% = the bottleneck. ncu kernel-name gotcha: match the *real*
 kernels (`nvjet` for cuBLAS GEMM, `vectorized_elementwise` for the add) — `elementwise` alone also
 matches `randn`'s init kernel. Files: `roofline_diagnose.py`, `ncu_target.py`, `roofline_diagnose.png`.
+
+---
+
+# Part 2 — Session addendum: op taxonomy, batching economics, warp/latency internals
+
+New figures (`h100_setup/`): `batched_forward.png` (prefill packing vs decode + op taxonomy),
+`bandwidth_util.png` (warp latency-hiding: under-utilized ~20% vs saturated ~72%).
+
+## 10. Per-token (position-wise) vs cross-token ops — only attention mixes tokens
+Classify by whether an op combines **different token positions** (the token axis) — NOT by whether it has
+an internal reduction:
+- **PER-TOKEN (batches for free — one GEMM/elementwise over all tokens):** embedding; RMSNorm/LayerNorm
+  (*reduces over FEATURES within a token*); all Linears/GEMM; RoPE (*uses each token's own position*);
+  activations SiLU/GELU/**sigmoid**/SwiGLU (*elementwise*); residual add; sampling softmax (*over VOCAB*).
+- **CROSS-TOKEN (needs seq boundaries):** **ATTENTION only** — `QKᵀ → softmax over KEYS → ·V`.
+- **Rule: an internal reduction ≠ cross-token.** Softmax mixes only along the axis applied — over **KEYS**
+  ⇒ attention (cross-token); over **VOCAB** ⇒ sampling (per-token). RMSNorm reduces over **FEATURES** ⇒
+  per-token. This is why **only attention** consumes `cu_seqlens`/`block_tables`; everything else sees a
+  flat `[tokens, hidden]` batch and batches trivially.
+
+## 11. How the batched input is built (fig `batched_forward.png`)
+- **PREFILL = flat "varlen" packing**: all scheduled tokens of all seqs **concatenated into ONE 1-D
+  `input_ids [total_tokens]`** (no padding); `positions` restart per seq; **`cu_seqlens_q/k`** mark seq
+  boundaries → `flash_attn_varlen_func` applies a **block-diagonal (per-seq causal) mask** (cross-seq blocks
+  are *skipped*, not computed-then-masked).
+- **DECODE = 1 token/seq**: `input_ids [B]`; `positions=[len-1]`; `context_lens`; **`block_tables`** (which
+  paged blocks hold each seq's KV); `slot_mapping` (1 slot/seq for the new K,V) → `flash_attn_with_kvcache`
+  gathers each seq's own KV.
+
+## 12. Two levers of batching + the shared-vs-per-seq reconciliation
+Two independent throughput levers:
+- **① arithmetic intensity** — amortize a **SHARED** HBM read → raises FLOP/byte → can flip memory→compute bound.
+- **② GPU utilization** — fill SMs + hide latency + saturate bandwidth → bottleneck *stays*, but is fully used.
+
+Decisive question: **is the data read from HBM SHARED across the batch, or PER-SEQ?**
+| op | reads | shared? | intensity vs batch | batching mechanism |
+|---|---|---|---|---|
+| **Linear** | weights | **YES** | **rises ∝ tokens** (W read once) | **① intensity** (memory→compute); depends on **TOTAL TOKEN count, seq-agnostic** (a big prefill amortizes as well as many decode seqs); occupancy usually already fine |
+| **Attention** | KV cache | **NO** (per-seq) | **flat** (bytes scale with batch too) | **② utilization only** — stays memory-bound |
+- Reconciles the apparent contradiction: batching raises intensity for **linear** (shared weights) but **not
+  attention** (per-seq KV) — for attention it only *fills the machine*.
+- Even when attention stops gaining (long context saturates), **linears keep gaining from ① at any context**
+  → batching decode stays worthwhile overall.
+- **Long context** tilts total cost toward the **non-amortizable per-step KV read** (can exceed weight bytes)
+  → per-token throughput degrades → why KV-size opts (paging, quantized KV, GQA/MQA) matter.
+
+## 13. Why `max_num_batched_tokens` exists
+(a) **Activation memory** — intermediates ~`total_tokens×hidden` must fit in HBM left after weights+KV
+(measured in `warmup_model`); (b) **compute saturation** — past the roofline ridge, more tokens add
+**latency**, not throughput/token.
+
+## 14. Warp / SIMT internals (refines §1)
+- **HARDWARE: SM, warp.  SOFTWARE: thread block, thread, grid, tile.** CPU analogies: thread block ≈ "a task
+  pinned to a core"; warp ≈ a **32-wide SIMD bundle** (no clean process analogy); tile = the data-chunk a
+  block owns.
+- A **thread runs the WHOLE kernel on its OWN data element** (not "one line of code"; "lane" ≠ "line").
+- **SIMT**: the 32 threads of a warp execute the **same instruction at the same time (lockstep parallel)**,
+  each on its own data — **NOT one-after-another**. Only the instruction stream advances over time, in sync
+  across all 32 lanes.
+- **Warp divergence**: if lanes branch differently, hardware **serializes** the paths (masked) → lost
+  parallelism. Uniform branch = full parallel.
+- Two levels: **within a warp** (32 lanes lockstep) + **across warps** (4 schedulers/SM issue several
+  concurrently; many resident warps time-sliced for latency hiding).
+
+## 15. Memory-latency hiding, quantified (fig `bandwidth_util.png`)
+- HBM = **high bandwidth BUT high latency**. To *use* the bandwidth you need **many reads in flight**
+  (Little's law: achieved BW ≈ concurrency ÷ latency).
+- **1 seq / few warps** → 1–2 KV reads in flight → bandwidth **under-utilized (~20%)**; SM mostly waits.
+- **Many seqs / many warps** → whenever a warp stalls on a load, another computes → ~6–8 reads in flight →
+  bandwidth **saturated (~72%)**; same per-seq work finishes far sooner.
+- This is the **same mechanism as "more tiles"** — more independent warps fill compute **and** the memory
+  pipeline at once. Computation never waits for "all memory read first" (flash-attn **streams KV block-by-block**).
+
+## 16. Why one seq can't fill the GPU, and why KV-splitting is bounded
+- One-seq decode-attention parallelism ≈ **(query heads) × (KV-splits)**. The **missing axis vs prefill**:
+  **query tokens = 1** (prefill parallelizes over N query rows; decode lost it).
+- Flash-Decoding manufactures KV-splits but **can't split infinitely**: (a) each split needs a big-enough KV
+  **tile** (~128–256 keys) to amortize per-split setup; (b) softmax reduces over **ALL** keys → more splits =
+  bigger online-softmax **combine** step; (c) partials go through **HBM** → more splits = more partial traffic
+  (bad for memory-bound). Useful splits ≈ `L / tile_size` → few for short context.
+- So: **Flash-Decoding** fills the GPU from ONE seq when **context is LONG** (small batch); **batching** adds
+  back the **query-token axis** (`heads × splits × B`, cleaner parallelism) when **context is SHORT**. Both
+  aim for `#work-units ≫ #SMs` with enough resident warps.
+
+## 17. Async scheduling — NOT in nano-vllm
+- `llm_engine.step` is **fully synchronous**: `schedule() → run() → postprocess()`, serial; `run()` ends in
+  `.tolist()` (D2H sync) → the CPU can't overlap the next `schedule()` with the current forward.
+- **Async scheduling** (vLLM V1) builds step N+1's batch on the CPU **while the GPU runs step N** — hides
+  CPU schedule/prepare/postprocess behind compute. Needs deferred output handling + speculative next-batch
+  (corrected on EOS). **Backlog** for nano-vllm; independent of the other optimizations.
+
+## 18. Paged KV (storage) vs KV-split (Flash-Decoding) — independent concepts
+Two "chop up the KV" ideas at **different layers**:
+| | **KV page / block** (paged attn) | **KV-split** (Flash-Decoding) |
+|---|---|---|
+| what | **storage/addressing** unit in HBM | **parallelization** unit (context slice → one SM) |
+| set by | engine (`kvcache_block_size`=256), **fixed** | kernel, **per-launch heuristic** |
+| for | **memory management** (fragmentation vs metadata) | **occupancy** (fill SMs) |
+| carrier | `block_table` (logical→physical); write via `slot_mapping` | kernel inner loop / `num_splits` |
+- **No 1:1 requirement.** A split is a **range of the context spanning many pages**; it gathers its pages via `block_table`. Split *count* is occupancy-driven, **independent of page size** (split boundaries are usually page-aligned for gather cleanliness, but that's convenience). Paging = *how KV is stored & addressed*; splitting = *how the kernel reads & computes over it in parallel*.
+
+### Paged attention: benefit vs cost (it's a trade-off, not free locality)
+- **Benefit (the win): memory efficiency, not compression.** Contiguous per-seq allocation reserves `max_seq_len` → **60–80% waste**; paging allocates blocks **on demand** (~few-% waste) + allows **prefix sharing** → **more concurrent seqs → bigger batch → more throughput.**
+- **Cost:** paging **scatters** pages + adds `block_table` **indirection** → *slightly less* locality than contiguous, **not more**. Locality is kept **"good enough"**: within a block KV is contiguous (**coalesced**), and the block (256) is big enough that the per-block lookup is negligible. A split's read = **"contiguous within each page, hopping between scattered pages"** (a gather of coalesced chunks).
+- **`block_size` trade-off:** bigger → more coalescing + less metadata but **more tail fragmentation**; smaller → less waste but **more indirection**. 256 balances.
+
+### Coalescing granularity — what the warp actually cares about
+Size hierarchy: **`load ⊆ tile ⊆ page ⊆ split`**.
+- A **load** (one instruction, 32 lanes → consecutive addresses) is the **coalescing unit** — tens/hundreds of bytes, **far smaller than a page** → it **always lands inside one page**.
+- The warp **cares about within-page contiguity** (for coalesced loads); it is **indifferent to inter-page adjacency** — scattered pages are resolved by `block_table` (each page read from its own base addr).
+- **Multiple pages per warp/block is normal** (a split = many pages): the kernel loops **tile-by-tile**, switching page base address **between** loads — never straddling a page boundary within a load. So scattered pages cost only a tiny **per-block lookup**, no coalescing penalty.
+- **Real coupling: page size ↔ kernel TILE size**, NOT page ↔ split size. The page must be a **multiple of / aligned to the kernel's `BLOCK_N`** so tiles never cross a page boundary.
+
+### flash-attn is a **paged-aware** kernel (imposes the block_size rule)
+- Vanilla flash-attn (contiguous `[B,L,H,D]`) is **not** paged-aware. nano-vllm's paths **are**: `flash_attn_with_kvcache(..., block_table=…, cache_seqlens=…)` (decode) and `flash_attn_varlen_func(..., block_table=…)` (prefill cache-hit) — they **gather scattered pages** via `block_table`.
+- Because it's **tile-based**, it **requires `block_size` to be a multiple of its internal `BLOCK_N`** (16 or 256 by version) so tiles stay inside a page. **The kernel dictates the rule; the engine picks a compatible `block_size`** — nano-vllm's **256** satisfies it *and* is memory-efficient.
+- **Co-design:** paging (storage) needs a paged-aware kernel to read it — options: **vLLM's own `paged_attention` CUDA kernel**, **flash-attn's paged path** (nano-vllm), **FlashInfer**. Each takes `block_table` and imposes its own alignment rule.

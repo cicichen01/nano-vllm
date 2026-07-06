@@ -140,6 +140,84 @@ rows, and replays.
   static-buffer layout for the decode forward.
 - So yes, a bespoke `capture_cudagraph` per engine (often per model family) is normal for high-perf serving.
 
+---
+# Part 2 — Trace-reading & internals deep-dive
+
+## 7. FX graph vs CUDA graph (different things, same word "graph")
+| | **FX graph** | **CUDA graph** |
+|---|---|---|
+| what | a description of tensor *ops* (matmul, add, gelu) | a recording of GPU *kernel launches* + fixed addresses |
+| made by | TorchDynamo (torch.compile front-end) | CUDA driver (`torch.cuda.graph`) |
+| when/where | compile time, on CPU (Python objects) | runtime, on GPU/driver |
+| purpose | let Inductor optimize/fuse → generate kernels | replay many launches as one `cudaGraphLaunch` |
+| a "break" | splits into 2 FX graphs (untraceable code) | N/A |
+Pipeline: Python → **FX graph** (recipe) → Inductor **fused kernels** (how) → optionally record launches → **CUDA graph** (replay cheaply). FX graph = plan; CUDA graph = recording of the execution.
+
+## 8. `explain` vs `compile`; neither "builds the model"
+- `make(fn)` builds the *function* (weights are pre-existing globals).
+- `torch._dynamo.explain(fn)(x)` — runs Dynamo trace for a **report** (`graph_break_count`, `graph_count`), no Inductor, throwaway.
+- `torch.compile(fn)` — runs Dynamo **+ Inductor** → cached **fast callable**. Both trace (so both see the same breaks); only `compile` generates runnable kernels. `torch._dynamo.reset()` between them clears the cache so `compile` recompiles cleanly.
+
+## 9. Compile-id `X/Y` (the "Torch-Compiled Region: X/Y" marker)
+- **X = frame id** — which compiled function.
+- **Y = frame_compile_id** — **which cached version (specialization) is executing here**, numbered in creation order. NOT a running "total compiles" counter — it's a *version tag* chosen per-call by shape via guards.
+- torch.compile **specializes on shape by default** → a new shape fails the guard → a **new version** (higher Y) is compiled. Different functions meet different #s of shapes → different max Y.
+- **Nested markers** (`0/0` wraps whole call, `1/0` nested) = a **graph break**: `0/0` is the entry frame (ran subgraph1 + the eager break op + *called* the resume continuation), `1/0` is the synthesized **resume function** (subgraph2), called from inside `0/0`.
+- **Reuse vs recompile in a trace** (proven on `qwen_eager.json`, frame 0 ran both `0/4`×20 and `0/5`×1120): (a) **interleaved** old+new versions → reuse (a recompile is one-way; the old version can't resurface); (b) **no ms-scale spike** on any first call (all µs) → nothing compiled inside the trace. A *real* recompile = a brand-new Y appearing with a **ms-scale first call** + Dynamo/Inductor CPU activity. `cache_size_limit` (default 8) caps versions; beyond it → eager/dynamic fallback.
+
+## 10. Graph breaks: `.item()` = host-sync AND break (separable costs)
+`.item()`/`.tolist()`/`.cpu()`/data-dependent `if`/opaque custom ops trigger a break. `.item()` bundles **two independent costs**:
+- **sync bubble** (from the *host read*): CPU must wait for the GPU value → can't run ahead → GPU/CPU idle bubble. Happens even in eager. It's a *serialization/overlap* loss, **not** extra per-kernel launch overhead.
+- **lost fusion** (from the *graph split*): 2 subgraphs → intermediates go to HBM, no cross-break fusion. Happens for **any** break.
+They're separable: a **non-syncing** break (custom `flash_attn`) → fusion loss only, overlap preserved; `.item()` → both. Demo `graphbreak_with.json` (1 break → **2** compiled regions) vs `graphbreak_without.json` (**1** region). **The model still runs correctly** — this is why nano-vllm can `@torch.compile` around flash_attn.
+
+## 11. Reading kernels in a trace (kernels ≠ Python ops)
+From `graphbreak_without.json` (`g(x)=gelu(x@W); (a*1.0)@W` → 5 kernels):
+- **each matmul can be 2 kernels**: `cutlass sgemm` + `cublasLt splitKreduce_kernel` — cuBLAS picked a **split-K** algo (small M, large K → split the contraction across blocks → partial sums, then a reduce kernel). fp32 → `simt_sgemm` (CUDA cores, not tensor cores).
+- **pointwise ops fuse**: `gelu` + `*1.0` → one `triton_poi_fused_gelu_mul_0`.
+- **fusion follows the subgraph boundary**: in the break case, `gelu` fused with the `sum` feeding `.item()` (`triton_red_fused_gelu_sum`) instead of with `mul` — where you break changes what welds together.
+- **Pointwise op** = elementwise, `out[i]=f(in[i])`, no cross-position mixing (gelu, silu, add, mul, scale). Memory-bound alone; prime fusion candidates. NOT pointwise: matmul (mixes row×col), reductions (sum/mean/softmax/norm), attention.
+
+## 12. Where nano-vllm applies `@torch.compile` (5 functions → 5 frames)
+`grep @torch.compile nanovllm/layers/*.py`:
+| frame | function (file:line) | kernel(s) | calls/decode-step |
+|---|---|---|---|
+| 0 | `RMSNorm.add_rms_forward` (layernorm.py:28) | `..._add_mean_mul_pow_rsqrt` | 56 = 2×28 (input+post norms, +final) |
+| 1 | `RotaryEmbedding.forward` (rotary_embedding.py:37) | `..._cat_0/_cat_1` | 28 |
+| 2 | `RMSNorm.rms_forward` (layernorm.py:16) | `..._mean_mul_pow_rsqrt` | 56 = 2×28 (q_norm, k_norm) |
+| 3 | `SiluAndMul.forward` (activation.py:8) | `..._mul_silu` | 28 |
+| 4 | `Sampler.forward` (sampler.py:7) | softmax/argmax | 1 |
+- Decorators are on the **branch sub-methods** (`rms_forward`/`add_rms_forward`) not `forward()`, to avoid breaking on the `if residual is None`. The kernel name literally lists the fused ops (`_to_copy`=dtype cast, `add`=residual, `pow/mean/rsqrt/mul`=RMSNorm math) — ~7 eager ops → **1 fused Triton kernel**.
+- **`enforce_eager=True` only disables CUDA graphs, NOT `@torch.compile`** → these 5 still run as compiled Triton kernels with "Torch-Compiled Region" markers even in the eager trace.
+- **No marker ⇒ not torch.compiled**: `store_kvcache_kernel` (hand-written `@triton.jit`), `flash_fwd_*` (flash-attn library CUDA), `nvjet` GEMM (cuBLAS), `splitKreduce`.
+
+## 13. Decode kernel anatomy: 15 kernels = ONE decoder layer
+The `cudaGraphLaunch` replays 28× this 15-kernel block (28 layers). Per layer:
+```
+ATTENTION block (1–10):
+  rmsnorm(input) → qkv_proj[GEMM] → q_norm,k_norm[2×rmsnorm] → RoPE q,k[2×cat]
+  → store_kvcache → flash_fwd_splitkv + combine (Flash-Decoding: split KV across SMs, then merge)
+  → o_proj[GEMM]
+MLP/FFN block (11–15):   (= FFN = SwiGLU, gated)
+  rmsnorm(post) → gate_up_proj[GEMM] → SiluAndMul → down_proj[GEMM+splitKreduce]
+```
+Notes: **4 RMSNorms/layer** incl. Qwen3's distinctive **QK-norm** (q_norm/k_norm); **4 GEMMs/layer** (`nvjet`=cuBLAS tensor-core); decode attention = **2 kernels** (Flash-Decoding split+combine). 15×28 + embed + final norm + lm_head ≈ **~432 kernels/step** (matches measured).
+
+## 14. Memcpy / pinned memory / H2D physics
+Around `cudaGraphLaunch` in `qwen_graph.json`: **6× HtoD** (`prepare_decode` uploads per-step metadata from pinned CPU) + **5× DtoD** (stage into the **static `graph_vars` buffers** the graph reads from — graph reads *frozen addresses*, must refresh each step) + **1× DtoH** (`.tolist()` tokens back to CPU). **Normal + mandatory** (input staging must live *outside* the graph).
+- **Not worth optimizing**: real GPU-side transfer = **13 µs/step = 0.85%** of the 1561 µs/step compute. The big CPU numbers (`cudaMemcpyAsync` 1477 µs, `cudaGraphLaunch` 427 µs) are **API wait/blocking, not bytes** — dominated by the `.tolist()` **sync** (inherent to reading a token/step).
+- **Pinned memory** = page-locked host RAM (OS can't move/swap it). DMA needs a **fixed physical address**. **Pageable** source → CUDA must first copy to a hidden pinned **staging buffer (still in host RAM)** → DMA to HBM = **2 moves**. **Pinned** source → DMA straight to HBM = **1 move**. The staging buffer is **host memory, not HBM**; every H2D ends with bytes physically in **HBM** (GPU cores read HBM, not host). `.cuda()` always materializes in HBM (zero-copy/mapped memory is a separate opt-in, slow, not this path).
+- **`non_blocking=True`** = the copy call returns immediately (CPU races ahead); the DMA runs in background. Only meaningful **on pinned memory** (pageable forces the sync staging copy anyway). Pinned + non_blocking = async DMA overlapping CPU work.
+
+## 15. Custom kernels & how they compose with torch.compile
+"Custom kernel" = anything you didn't let Inductor generate: **`@triton.jit`** (easiest hand-written), **raw CUDA C++** (`cpp_extension`), **CUTLASS/CuTe**, or **prebuilt libraries** (cuBLAS, cuDNN, flash-attn). "Triton" isn't the dividing line — **Inductor itself emits Triton**; the line is *compiler-generated* vs *hand-written*.
+- **Why hand-write**: algorithms Inductor can't invent (flash-attn online-softmax, paged-KV scatter, MoE, quant), layout/tensor-core control, or beating suboptimal generated code. nano-vllm mixes all: generated-Triton norms/act, hand-`@triton.jit` `store_kvcache`, library flash-attn + cuBLAS.
+- **torch.compile + a custom kernel**: since ~2.3 it can **include a user `@triton.jit` in the graph without a break**, but treats it as an **opaque black box** — it **fuses *around* it, never *into* it**. Your kernel stays its own launch, unchanged. (Prologue/epilogue fusion into a kernel is only for Inductor's *own* templates, e.g. its matmul.) To avoid a break on a CUDA/opaque op, register it with `torch.library.custom_op` + `register_fake`.
+
+## 16. nano-vllm vs vLLM CUDA graphs; cost of going "torch.compile-only"
+- **vLLM has manual CUDA graphs too**: V0 `CUDAGraphRunner`/`capture_model` (same bucketed-static-buffer pattern nano-vllm mirrors); V1 (torch.compile era) uses a **custom Inductor backend for fusion + manually-captured "piecewise CUDA graphs"** around the attention op. It does **not** rely on `mode="reduce-overhead"` alone.
+- **Making nano-vllm torch.compile-only** (`model_runner.py`): mechanically small — ~5 edits, −50 lines (drop `capture_cudagraph` L222–257, the `run_model` graph branch L199–212, init/exit hooks; add `torch.compile(self.model, mode="reduce-overhead")`). **But to keep the 6.5× decode win** you must also: (1) **kill the global `Context`**, threading slot_mapping/block_tables/context_lens as **tensor args** through model→layer→attention (Dynamo can't trace mutable globals; cudagraph needs stable-address tensors) — touches context.py/attention.py/qwen3.py; (2) **register `store_kvcache`+`flash_attn` as custom ops**; (3) **re-add bucket padding** (cudagraphs need static shapes; varying `bs` else recompiles/recaptures per size). → complexity **relocates, not disappears**. That's why both nano-vllm and vLLM hand-roll cudagraphs: serving hits all 3 of cudagraph's hard constraints at once (dynamic batch, custom attention op that breaks the graph, in-place KV writes via metadata tensors).
+
 ## 6. Read more
 - PyTorch: "Introduction to torch.compile"; torch.compiler docs; CUDA semantics → "CUDA Graphs";
   torch.cuda.graph / make_graphed_callables API; blog "Accelerating PyTorch with CUDA Graphs".
