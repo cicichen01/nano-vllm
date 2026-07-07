@@ -84,3 +84,106 @@ tensor and calls it, which **narrows to this rank's TP slice** and copies in.
 2. **`weight_loader` + `packed_modules_mapping`** (how separate HF q/k/v/gate/up land in fused, TP-sharded params).
 3. **`ParallelLMHead` last-token trick** (prefill computes logits for last position only).
 Everything else was already seen at the kernel level in earlier notes.
+
+## ★★ Pre-norm vs post-norm (why 2 norms/layer, and why pre-norm)
+Figures: `residual_stream.png`, `prenorm_vs_postnorm.png`, `grad_prenorm_postnorm.png`, `grad_decay.png`.
+
+**Two norms per layer = one PRE-norm per sub-block, NOT "before+after attention":**
+- `input_layernorm` = pre-norm for **attention**; `post_attention_layernorm` = pre-norm for the **MLP**
+  (named by *position*, it's the MLP's input norm). Plus `q_norm`/`k_norm` = Qwen3 QK-norm *inside*
+  attention (separate purpose), and a final `model.norm` before the LM head.
+- Each sub-block needs a normalized input because the **residual stream grows with depth** — re-normalize
+  before every consumer so attention/MLP always see well-scaled activations.
+
+**Pre-norm vs post-norm (a MODEL-architecture choice, lives in `DecoderLayer.forward`, not the engine):**
+- pre-norm (Qwen3/Llama): `x = x + Sub(Norm(x))` — norm on the **side branch**; residual is a **clean identity line**.
+- post-norm (2017 Transformer): `x = Norm(x + Sub(x))` — norm **on the residual path** (wraps the add).
+- Same op *count* (1 add + 1 norm/sub-block) — the difference is **placement relative to the skip**.
+
+**The subtle equivalence + where they diverge:** at the attn→MLP boundary BOTH compute `Norm(r + attn_out)`
+as the MLP input — identical there. They diverge at the **MLP's residual add** and what continues:
+- pre-norm: `Norm(r+attn)` is a **throwaway branch** (feeds MLP only); the stream carries the **un-normed**
+  `r1=r+attn`; MLP add = `r1 + mlp_out` (adds to un-normed). → a **raw un-normed copy of the stream survives**.
+- post-norm: `Norm(r+attn)` **IS** the stream; MLP add = `Norm(x1 + mlp_out)` (adds to normed, re-norms). → no raw survivor.
+- Count norms on the residual path itself: **pre-norm 0**, **post-norm 2/layer**.
+
+**Why it matters — gradients (backprop through L layers; both are PRODUCTS of L factors):**
+- Symbols: `J_i` = pre-norm sublayer-path Jacobian `∂[Sub(Norm(r_i))]/∂r_i` (includes norm, small);
+  `S_i` = post-norm sublayer Jacobian; `N_i = ∂Norm/∂(·)` (NOT identity; rescales/rank-deficient); `I` = raw skip.
+- **pre-norm:** `∂r_{i+1}/∂r_i = I + J_i` → `∂r_L/∂r_0 = ∏(I+J_i) = I + ΣJ_i + Σ J_jJ_i + …`
+  → has a **bare I** (route through ZERO norms) → clean gradient highway; `≈ I+ΣJ_i` when `J_i` small.
+- **post-norm:** `∂r_{i+1}/∂r_i = N_i(I+S_i)` → `∂r_L/∂r_0 = ∏ N_i(I+S_i)`; smallest term `= ∏N_i` (NO bare I)
+  → **L norm-Jacobians compound** → vanish/explode → needs LR warmup + careful init.
+- The residual `+r` is what puts the additive `I` **inside every factor**; post-norm's outer Norm strips it.
+
+**Measured (`grad_demo.py`/`grad_demo2.py`):**
+- Real L=64 nets, unit grad at output → |grad@input|, ratio pre/post: gain1 **6×**, gain2 9×, gain3 30×, gain4 **34×**
+  (pre GROWS with depth/gain — accumulates on the identity highway; post throttled ~O(1) or below).
+- Controlled toy `∏(I+J)` vs `∏0.9(I+S)`: at L=160 pre=**5088** vs post=**2.4e-4** (post vanishes as `0.9^L`).
+  (Real RMSNorm resets rms≈1/layer so `N≈I` at benign init → post doesn't dramatically vanish there, just
+  fails to accumulate; the toy's `N=0.9` exposes the mechanism when rms>1 makes the norm contract.)
+
+**Engine impact:** swapping to a post-norm model = write a new `DecoderLayer.forward` in a **new model file**
+(and drop the fused deferred-add — post-norm can still fuse its own add+norm, but there's no un-normed
+residual stream to defer); the scheduler/paging/runner/kernels are untouched.
+
+## ★★ Weight loading mechanics (`utils/loader.py` + `weight_loader`)
+**`weight_loader` is a vLLM convention, NOT a PyTorch feature** — a function **stapled as an attribute onto each
+`nn.Parameter`** (`self.weight.weight_loader = self.weight_loader` in `LinearBase`), invoked by a **custom load
+loop** that replaces PyTorch's native `load_state_dict`.
+
+**Module <-> Parameter <-> weight_loader (the reference loop):**
+- Module **owns/registers** the Parameter (`module.weight` is the tensor in HBM).
+- Parameter **carries** `weight_loader` as a plain attribute.
+- `weight_loader` is the Module's **bound method** -> closes over `self` so it can read TP config
+  (`tp_rank`, `tp_size`, `num_heads`, `output_sizes`, ...). So: Module->Param (owns), Param->loader (attr), loader->Module (method).
+
+**Dotted names = the module-tree path.** A param's name (`model.layers.0.self_attn.q_proj.weight`) is the
+concatenation of **attribute names** down the tree (`nn.ModuleList` -> numeric index `layers.0`). `get_parameter(name)`
+splits on `.` and walks `getattr` -> the SAME object as attribute access. Checkpoint = `{name_string: tensor}` (pure
+data); loading = get the right numbers into the right param buffer so `forward` computes the intended function.
+
+**Two ways to load a checkpoint (the fundamental choice):**
+- **Option 1 (HF):** define the Module to **match the checkpoint 1:1** (names+shapes) -> `model.load_state_dict()` just works.
+- **Option 2 (nano-vllm):** define the model **fused + TP-sharded** for speed -> write a **translation** loader
+  (rename/offset/slice/reshape) that must be **math-equivalent** (fuse q/k/v = concat; forward splits it back).
+  (Variants: convert the ckpt offline; or PyTorch `_load_state_dict_pre_hook`.)
+
+**The load loop (`load_model`) is CHECKPOINT-driven:**
+```python
+for weight_name in f.keys():                       # e.g. "...self_attn.q_proj.weight"
+    for k in packed_modules_mapping:               # k = "q_proj","k_proj","v_proj","gate_proj","up_proj"
+        if k in weight_name:                        # SUBSTRING test (fragment in full path) -> covers ALL layers
+            v, shard_id = packed_modules_mapping[k] # ("qkv_proj","q")
+            param = model.get_parameter(weight_name.replace(k, v))   # rename fragment -> fused param
+            param.weight_loader(param, f.get_tensor(weight_name), shard_id)   # WITH shard_id
+            break
+    else:                                           # no fused match
+        param = model.get_parameter(weight_name)
+        getattr(param, "weight_loader", default_weight_loader)(param, f.get_tensor(weight_name))  # NO shard_id
+```
+- **Fused q/k/v hit the loop 3x separately** (checkpoint has 3 tensors); each renamed `*_proj->qkv_proj` and written
+  into its **row-slice** of the ONE fused param (`q` 0:2048, `k` 2048:3072, `v` 3072:4096 for 0.6B). Then forward =
+  one GEMM + `split`. Same for gate/up -> `gate_up_proj`.
+- **`k in weight_name` = substring** (mapping keys are short fragments; checkpoint names are full dotted paths) -> one
+  entry matches that fragment in **every** layer, index-agnostic. `.replace(k,v)` swaps just the fragment.
+
+**Why the two branches never mismatch the loader signature (design invariant):**
+- The **`shard_id` branch** is reached ONLY for `packed_modules_mapping` targets = the **fused** modules `qkv_proj`
+  (`QKVParallelLinear`) / `gate_up_proj` (`MergedColumnParallelLinear`) — whose `weight_loader` **DOES** take `shard_id`.
+- The **`else` branch** (no `shard_id`) handles everything else — `RowParallelLinear` (`o_proj`,`down_proj`),
+  `VocabParallelEmbedding` (`embed_tokens`,`lm_head`), and `RMSNorm`/norms (no custom loader -> `default_weight_loader`)
+  — whose loaders take **no** `shard_id`.
+- Invariant: **`packed_modules_mapping` keys map only to fused modules whose loader accepts `shard_id`.** Add a mapping
+  entry pointing at a non-sharded loader -> `TypeError` (extra positional arg). `RowParallelLinear` is never in the
+  mapping, so it's never passed `shard_id`.
+
+**Load = H2D transfer.** Model built with `set_default_device("cuda")` -> params in HBM; `safe_open(..., "cpu")` ->
+`get_tensor` gives a **CPU** tensor (mmap'd from the file, disk->CPU lazily). `weight_loader` narrows to this rank's
+shard (cheap CPU view) then `param.data.copy_(shard)` = **CPU->GPU H2D** of only that slice, in-place into the
+pre-allocated HBM buffer.
+
+**Generic vs fused param layout** (Qwen3-0.6B, one layer): generic = 7 separate params (`q/k/v/o_proj`,
+`gate/up/down_proj`, matching ckpt); fused = 4 (`qkv_proj[4096,1024]`, `o_proj`, `gate_up_proj[6144,1024]`,
+`down_proj`). TP=2 further halves the split dim (qkv/gate_up / dim0, o/down / dim1). Fusion = fewer/bigger GEMMs at
+runtime; the custom loader is the load-time price.
