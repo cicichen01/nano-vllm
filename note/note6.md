@@ -187,3 +187,115 @@ pre-allocated HBM buffer.
 `gate/up/down_proj`, matching ckpt); fused = 4 (`qkv_proj[4096,1024]`, `o_proj`, `gate_up_proj[6144,1024]`,
 `down_proj`). TP=2 further halves the split dim (qkv/gate_up / dim0, o/down / dim1). Fusion = fewer/bigger GEMMs at
 runtime; the custom loader is the load-time price.
+
+## ★★ Tensor-parallel data-flow (per-module design; replicate cheap, shard big)
+Figure: `tp_dataflow.png`. Demo: `h100_setup/tp_parallel_demo.py` (+ TP figures).
+
+**TP is a PER-MODULE design, coordinated across neighbors.** Each layer type gets its own scheme, and the
+schemes are chosen so **one module's output sharding = the next module's expected input sharding** → activations
+stay sharded through a block and reconcile with the **minimum** collectives.
+
+**The canonical transformer recipe (Megatron), as in nano-vllm:**
+| module | scheme | input | output / comm |
+|---|---|---|---|
+| `input_layernorm`, `post_attn_LN`, residual add | **replicated** | full | full (both ranks recompute locally, NO comm) |
+| `qkv_proj`, `gate_up_proj` | **column-parallel** | replicated | sharded slice (this rank's heads / inter dim) |
+| attention (per-head), `q_norm`/`k_norm`, RoPE, SiluAndMul | **per-rank** | sharded | sharded (no comm) |
+| `o_proj`, `down_proj` | **row-parallel** | sharded | partial sum → **`all_reduce`** |
+| `embed_tokens` | **vocab-parallel** | replicated ids | masked → **`all_reduce`** |
+| `lm_head` | **vocab-parallel** | full | logits slice → **`gather`** |
+
+→ **2 `all_reduce`s per layer** (end of attention, end of MLP) + embedding all_reduce + LM-head gather = the minimum.
+
+**Why column→row chains:** `qkv (col)` splits heads → each rank runs ITS heads' attention with **no comm** →
+`o_proj (row)` takes that head-split as its sharded input → ONE `all_reduce`. (col→col would need an extra
+`all_gather`.) Same for `gate_up (col)` → act → `down (row)`. Get the pairing wrong → extra collectives; forget the
+row `all_reduce` → wrong result (only a partial — the `tp_parallel_demo.py` failure).
+
+**Why norms/act/residual are REPLICATED (not sharded):**
+- They're **tiny** (norm weight ≈ `[hidden]` ≈ 0.02% of params; elementwise+small reduction) and sit at a
+  **replicated island** between two `all_reduce`s (hidden is already full there).
+- Sharding a norm would need an **`all_reduce` per norm** (to reduce variance over `hidden`) → comm ≫ the trivial
+  compute saved. So replicate.
+- **Recompute-on-both beats compute-once-and-broadcast:** input already replicated (recompute moves **no data**),
+  compute is trivial and runs **in parallel** (twice ≈ once wall-clock), while a broadcast adds a **network
+  transfer + collective overhead + a serialization stall + an extra collective**. Classic *recompute-vs-communicate*:
+  comm ≫ cheap compute → redo it locally.
+
+**What tp=2 actually buys** (given norms are redundant): the win is in the **big matmuls / attention / vocab** which
+**are** split → **~2× weight capacity** (each rank holds half) + **~2× matmul throughput**. The replicated norms
+waste ~0.02% — negligible. Both ranks are always working (on the sharded big ops); norms are just a small redundant island.
+
+**Data-flow shape (fig):** replicated (blue) → `qkv/attn/o` sharded island → **`all_reduce`** → replicated → `gate_up/
+act/down` sharded island → **`all_reduce`** → replicated. **Sharded islands bracketed by 2 all_reduces.**
+
+**Is there a generic way?** No fully-automatic "optimal TP" in production inference, but generic *mechanisms* exist:
+**PyTorch DTensor + `parallelize_module(plan)`** (you give a per-module colwise/rowwise plan; it auto-shards weights +
+inserts collectives), **JAX GSPMD** (sharding propagation), experimental **auto-parallel search** (Alpa). Engines
+hand-roll (`ColumnParallelLinear`/`RowParallelLinear`/`VocabParallelEmbedding` classes) for control over fused
+weights, custom kernels (flash-attn/paged-KV), CUDA graphs, and quantization — and you still need the per-module
+knowledge (which scheme, column→row chaining) even to write a correct plan.
+
+## ★ Parallelism strategies (TP vs DP/PP/EP/SP-CP); nano-vllm supports TP only
+| strategy | what's split | what's replicated | comm | fits bigger model? | scales throughput? |
+|---|---|---|---|---|---|
+| **TP** (tensor) | each layer's **weights** | activations at replicated islands | heavy (2 all_reduce/layer, needs NVLink) | ✅ | ~✅ (also speeds one request) |
+| **DP** (data) | the **requests** | the **whole model** (full copy/rank) | none at inference (no grads) | ❌ (each rank needs full model) | ✅✅ (independent replicas) |
+| **PP** (pipeline) | model **by layers** (stages) | — | light (activations at stage boundaries); pipeline bubbles | ✅ | via micro-batching |
+| **EP** (expert) | **MoE experts** across ranks | dense/attention | expert all-to-all | ✅ (MoE) | ✅ |
+| **SP / CP** (sequence / context) | the **sequence/context** dim | weights | attention comm (ring, …) | fits long context | — |
+
+**nano-vllm = TP only** (`tensor_parallel_size`, single node). No DP/PP/EP/SP/CP — it's one model instance, TP-sharded.
+
+**TP vs DP (the crisp contrast):** TP = *one* model **split** across ranks, ranks **cooperate** on **one** forward
+(heavy per-layer comm) → **fit a big model** + speed a request; needs fast interconnect. DP = *whole* model **replicated**
+per rank, ranks run **different** requests **independently** (no comm at inference) → **more throughput**, does NOT fit a
+bigger model. TP within a node × PP across nodes × DP for replicas (× EP for MoE) is how big deployments combine them.
+
+**DP for inference:** no gradients ⇒ DP = **N independent replicas** (per-rank requests). For **dense** models you can
+just **launch N separate instances behind a router** — no model-level DP needed; vLLM's `--data-parallel-size` for dense
+is mainly a **serving convenience** (one endpoint, load balancing). nano-vllm: run multiple instances yourself.
+
+**MoE: DP + EP are entangled (NOT independent replicas):**
+- MoE FFN = many experts (e.g. 256), each token routed to top-k. **Total expert params are huge** → **can't replicate**
+  → **shard experts across ranks (EP)**: the full expert set = **ONE copy, partitioned** (each rank owns a distinct
+  subset), **not** duplicated per rank.
+- Run mode: **dense/attention replicated + data-parallel** (each rank its own requests, no comm) — cheap, per-rank KV;
+  **MoE layer = all-to-all**: dispatch each token to the rank owning its expert → compute → combine back. So ranks are
+  **coupled at MoE layers**; must launch DP+EP together in lockstep (impossible with naive separate instances).
+- Mental model: **dense = N replicas; experts = 1 copy split N ways, reached by cross-rank token routing (all-to-all).**
+
+**Where the MoE bottleneck is (DP+EP):** attention is **cheap per rank** (small DP-split batch, parallel, no comm).
+The **MoE layer is the coordination point** — it sees the **global token set** mixed via all-to-all. It's the bottleneck
+not because one GPU processes the whole batch (work is spread ≈ `B×top_k`/rank), but because of **(1) all-to-all comm**
+(2×/MoE layer, ∝ tokens×hidden), **(2) load imbalance** (hot experts → straggler rank → others idle at the sync), and
+**(3) aggregate token×top_k compute**. Mitigations: expert load-balancing (aux loss / capacity factor / drop),
+fast all-to-all (DeepEP) + comm/compute overlap, hot-expert replication, tuned EP degree.
+
+## ★ Data movement: mmap / page cache / pinned / H2D (weight load path)
+**Weights go disk → CPU RAM → GPU — never disk → GPU directly** (that would need GPUDirect Storage / cuFile, not
+used here). Two distinct transfer types: **DMA** (hardware moves bytes, no CPU) vs **CPU copy** (CPU runs a memcpy).
+
+- **Page cache** = the OS's RAM cache of file contents (kernel memory). Disk→page cache is a **DMA**, not a CPU copy.
+- **Buffered `read()`**: user code can't touch the kernel page cache → `read()` **copies page cache → user buffer**
+  (1 CPU copy), then you use/transfer that.
+- **mmap** (`safe_open(..., "cpu")`): **maps the page cache into user address space** → the tensor **views it directly,
+  zero-copy** (no read copy), and reads are **lazy** (pages fault in on touch). This is also how CPU-only use works
+  (map file → point a tensor at it → compute; no GPU needed).
+- **H2D copy accounting** (`param.copy_(cpu_tensor)`):
+  - source **pageable** (incl. mmap'd page cache — it's *pageable* to CUDA) → CUDA **stages pageable→pinned (1 CPU
+    copy)** → DMA to GPU.
+  - source **pinned** (`pin_memory=True`) → **direct DMA** to GPU (no staging copy).
+- **mmap and pinning remove DIFFERENT copies:** mmap removes the **read** copy (page cache→user buffer); pinning
+  removes the **H2D staging** copy. mmap'd pages are **not** pinned, so mmap alone does **not** speed the H2D.
+
+**TP=1 (whole tensor): mmap+H2D and pinned-read+H2D do the SAME CPU-copy work (1 copy each)** — mmap pays it at
+H2D-staging time, pinned-read pays it at read time (just a different stage). **Why mmap is still preferred:**
+(a) **no big pinned allocation** (pinned mem is scarce; mmap uses CUDA's small internal staging), (b) **lazy** →
+for **TP>1**, `narrow`-before-`copy_` faults/reads **only the shard** (contiguous shards) → less disk I/O + less copy;
+(c) map the whole file once, shareable.
+
+**nano-vllm's split:** **weights** use **mmap** (`"cpu"`) — one-time, big, TP-shardable, avoids huge pinned buffers;
+**hot per-step tensors** (`prepare_*`) use **`pin_memory=True` + `non_blocking=True`** — tiny, want fastest async H2D
+every step. (`torch.set_default_device("cuda")` governs only device-less factory calls → params/`graph_vars` on GPU;
+`safe_open(..., "cpu")` is an explicit device → checkpoint tensors on CPU; `copy_` bridges = H2D.)
