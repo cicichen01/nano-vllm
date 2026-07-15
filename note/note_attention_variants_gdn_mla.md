@@ -214,6 +214,67 @@ projections, keep per-head uniqueness in `W_UK`/`W_UV`, cache only the shared `c
 The one caveat: it *does* impose a shared `d_c`-dim subspace on all heads' K/V (a rank
 constraint), nearly free only because KV is empirically low-rank.
 
+### 3g. MLA as a constrained MQA (the wide-shared-latent view)
+
+**Quality via width, not via "having a lens".** MQA loses quality not because it shares
+the key, but because its shared key is *narrow* (`head_dim`). Widen the shared latent
+and sharing becomes nearly free:
+
+```
+MHA :  independent per-head keys, 128 each, total 4096   → best quality, huge cache
+MQA :  ONE shared key, 128-dim                            → narrow bottleneck, quality drop
+MLA :  ONE shared latent, 512-dim (+ per-head read lens)  → near-MHA quality, small cache
+```
+
+"Per-head read lens" = the per-head up-proj `W_UK^(h)`: the cached latent `c_i` is the
+SAME for all heads, but each head reconstructs its own key `k_i^(h) = W_UK^(h)·c_i`.
+
+**Why MQA's per-head `W_Q`/`W_O` don't count as the same lens.** MQA *does* have per-head
+`W_Q` (query lens) and `W_O` (output lens). But a lens only produces head-specific
+*reads* when the **shared cache is wider than the per-head matching rank**:
+
+> per-head diversity possible  ⟺  d_c (shared cache dim) > head_dim (per-head read rank)
+> MQA: 128 = 128 → no slack (all heads pinned to the same 128-dim view of the token)
+> MLA: 512 > 128 → each head's lens selects a different 128-dim slice → diversity
+> MHA: no shared cache → full diversity
+
+Rowspace argument: in MQA every head's matching matrix `M^(h)=W_Q^(h)ᵀW_K` shares the
+same 128-dim row space (`W_K` is shared), so `h_i` enters only through the identical
+`W_K h_i`; `W_Q^(h)` can *reweight* those 128 numbers but can't read different ones. In
+MLA `M^(h)=W_Q^(h)ᵀW_UK^(h)W_DKV` — the per-head `W_UK^(h)` gives each head a different
+128-dim slice of the shared 512-dim `W_DKV` span.
+
+**MLA ⊂ MQA-512.** Formally MLA = MQA-with-wide-shared-latent **plus** a per-head
+low-rank constraint: each head's Q/K/V/O projection factors through a `head_dim`
+bottleneck (rank ≤ head_dim). "MQA-512" (shared 512-dim head, full-rank per-head
+projections) has the **same cache** but ~3.6× more params and is strictly more
+expressive; MLA is its parameter-efficient, low-rank slice.
+
+| | KV cache/tok | per-head matching rank | query params/head | W_O |
+|---|---|---|---|---|
+| MQA-512 | 512 | ≤ 512 | 512×4096 = 2.1M | 4096×16384 = 67M |
+| MLA (d_c=512) | 512 | ≤ 128 | 128×4096+128×512 = 0.6M | 4096×4096+W_UV ≈ 19M |
+
+The rank-128 constraint is nearly free: 128 is the same per-head resolution MHA uses,
+and heads collectively span the 512 latent — so quality ≈ MQA-512 at far fewer params.
+
+**Conversion is one-way exact.** MLA→MQA-512 always exact (MLA is the subset).
+MQA-512→MLA exact **iff** the learned per-head `W_Q^(h)` (shape `d_c×d_model`) has
+rank ≤ head_dim; else lossy (best rank-head_dim / SVD truncation). Verified numerically
+(`d_model=6, d_c=4, head_dim=2`):
+
+```
+Case A  rank(W_Q)=2 (=head_dim):  singular values [4.849, 1.289, 0, 0]
+        discarded [0,0] → recon error 0.0 → scores identical (LOSSLESS)
+Case B  rank(W_Q)=4 (>head_dim):  singular values [3.725, 2.750, 1.628, 0.425]
+        discarded [1.628, 0.425] → recon error 1.683 → score -10.03 vs -7.56 (LOSSY)
+```
+
+A freely-trained MQA-512 almost always lands in Case B (full rank) → can't be
+re-expressed as MLA after the fact. Training *directly* in MLA form forces every head
+into the rank-`head_dim` slice from the start (Case A by construction) — the constraint
+that buys the param savings.
+
 ---
 
 ## 4. Hybrid stacks
@@ -294,6 +355,44 @@ collapse everything through one pattern.
 `head_dim` = lower-rank query-key matching. Sweet spot ~`head_dim 64–128`. This is
 exactly what MQA erodes (shared K/V kills head diversity) and MLA protects (per-head
 low-rank decompression).
+
+---
+
+## Appendix: matrix rank rules (the math behind the factorization)
+
+`rank(M)` = number of linearly independent rows (= independent columns = dim of the
+image). For `M` of shape `m×n`, `rank ≤ min(m, n)`; "full rank" = equality.
+
+**Product bounds** — for `A (m×n) · B (n×p)`:
+
+```
+Sylvester (lower):   rank(AB) ≥ rank(A) + rank(B) − n      (n = inner/shared dim)
+Upper:               rank(AB) ≤ min(rank(A), rank(B))
+```
+
+- **Bottleneck rule (the key one):** `rank(AB) ≤ n` (the inner dimension). A product
+  factored through an inner dim `n` can NEVER exceed rank `n`, whatever the entries.
+  Composition `R^p --B--> R^n --A--> R^m` squeezes everything through the `n`-dim middle.
+- **Example asked:** `A (3×2, rank 2) · B (2×4, rank 2)`, inner `n=2`:
+  upper `= min(2,2) = 2`; Sylvester `= 2+2−2 = 2`. Both pinch → `rank(AB) = 2` exactly.
+
+**Other facts used in this note:**
+- `rank(A) = rank(Aᵀ) = rank(AᵀA) = rank(AAᵀ)`.
+- A rank-`r` matrix `M (m×n)` factors **exactly** as `M = U·V` with `U (m×r)`, `V (r×n)`
+  — this *is* the low-rank factorization MLA relies on (r = `head_dim` / `d_c`).
+- **Best low-rank approximation** = truncated SVD (Eckart–Young): keep the top-`r`
+  singular values; the error is the discarded singular values. So factoring a rank-`k`
+  matrix through a smaller `r<k` bottleneck loses exactly the `k−r` smallest singular
+  directions (the Case-B loss in §3g).
+- Storing a rank-`r` map as a dense `m×n` matrix wastes space/compute unless
+  `r·(m+n) ≥ m·n`; the factored `U,V` form is cheaper when `r < mn/(m+n)` (why §3e's fold
+  inflates params: the dense `W_Q'` is `512×4096` but rank ≤ 128).
+
+**Where each shows up:**
+- Bottleneck rule → absorbed `W_Q' = W_UKᵀW_Q` is rank ≤ `head_dim` (§3e, §3f).
+- Exact factorization → `W_K = W_UK·W_DKV` cache trick (§3a).
+- Truncated-SVD loss → MQA-512 → MLA is lossless iff `rank(W_Q) ≤ head_dim`, else lossy
+  by the discarded singular values (§3g, Cases A/B).
 
 ---
 
