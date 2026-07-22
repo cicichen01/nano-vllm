@@ -1,0 +1,9 @@
+LINEAR attention (no softmax) — try both association orders:
+  (qKᵀ)V  [scores first] = [1.000 1.000]
+  q(KᵀV)  [state S first] = [1.000 1.000]
+  identical?  True   <-- ORDER DOESN'T MATTER, both interfere
+
+SOFTMAX attention — softmax sits BETWEEN qKᵀ and V (can't reassociate):
+  scores = [1.000 0.000 1.000]  softmax = [0.422 0.155 0.422]
+  softmax(qKᵀ)V = [0.422 0.578]   <-- different from linear (nonlinearity),
+                              but STILL blends the two identical-key tokens

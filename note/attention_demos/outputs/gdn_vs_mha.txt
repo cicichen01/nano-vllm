@@ -1,0 +1,7 @@
+MHA :  scores [1.000 0.000]  softmax [0.731 0.269]  -> y = [1.462 0.807]
+       (needs BOTH k1,v1 and k2,v2 kept around; recomputed every step)
+
+lin :  S =
+ [[2.000 0.000]
+ [0.000 3.000]]
+       y = qᵀS = [2.000 0.000]   (individual k1,v1,k2,v2 no longer needed)

@@ -1,0 +1,29 @@
+V (2 tokens x d_model=4):
+ [[1.000 1.000 1.000 1.000]
+ [0.000 0.000 0.000 0.000]]
+
+GOAL for the query's output: [1,1, 0,0]
+  = 'take features 0-1 from token 0, features 2-3 from token 1'
+
+==========================================================
+SINGLE HEAD: ONE softmax 'a' shared by ALL 4 dims
+==========================================================
+output = a*V[0] + (1-a)*V[1] = [a,a,a,a]  for ANY weight a
+  a=1.0 -> [1.000 1.000 1.000 1.000]
+  a=0.5 -> [0.500 0.500 0.500 0.500]
+  a=0.0 -> [0.000 0.000 0.000 0.000]
+  a=0.7 -> [0.700 0.700 0.700 0.700]
+
+BEST single-head fit: a=0.500 -> [0.500 0.500 0.500 0.500]
+  error vs target = 1.000   (CANNOT reach [1,1,0,0])
+
+==========================================================
+MHA: TWO independent softmaxes (a for head0, b for head1)
+==========================================================
+head0 weight a=1.0 -> [1.000 1.000]   (features 0-1 from token 0)
+head1 weight b=0.0 -> [0.000 0.000]   (features 2-3 from token 1)
+concat -> [1.000 1.000 0.000 0.000]
+  error vs target = 0.000   (EXACT)
+
+Takeaway: single head ties all dims to ONE distribution -> reachable
+outputs are only [x,x,x,x]. MHA's two distributions reach [a,a,b,b].

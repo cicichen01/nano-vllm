@@ -1,0 +1,19 @@
+Exp 1  mean cosine(recalled, true) over ALL stored items   (d_k=d_v=32)
+
+ #items M   plain   delta   ideal
+        4   0.935   0.951   1.000
+        8   0.894   0.935   1.000
+       16   0.842   0.842   1.000
+       32   0.704   0.682   1.000
+       48   0.621   0.520   0.803
+       64   0.551   0.419   0.689
+
+Exp 1b  RECENCY: overloaded memory M=64; recall of OLDEST-8 vs NEWEST-8 items
+  plain : oldest-8 = 0.565   newest-8 = 0.587
+  delta : oldest-8 = 0.151   newest-8 = 0.906
+  (plain ≈ uniform interference; delta sacrifices old for near-perfect RECENT recall)
+
+Exp 2  OVERWRITE: store 20 facts, revise 6; recall the revised keys
+  plain : cos(recall,NEW)=+0.557   cos(recall,OLD)=+0.620
+  delta : cos(recall,NEW)=+0.893   cos(recall,OLD)=-0.016
+  (good = high cos with NEW value, low/neg with OLD value)

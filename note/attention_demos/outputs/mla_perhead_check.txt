@@ -1,0 +1,18 @@
+KEY FACT: W_UK is PER-HEAD (that's what makes MLA differ from MQA).
+The shared latent c is d_c=512, but EACH head decompresses it with its
+OWN slice W_UK^(h) (128x512). If W_UK were shared -> that would be MQA.
+
+all-heads factored:
+  W_Q  (4096, 4096)  = 16,777,216
+  W_UK (4096, 512) = 2,097,152
+  total factored (all heads) = 18,874,368
+
+folded absorbed query W_Q'^(h) = W_UK^(h)^T @ W_Q^(h): (512, 4096) PER HEAD
+  per head       = 2,097,152
+  x 32 heads = 67,108,864   (all heads)
+
+compare (all heads):  factored 18,874,368  vs  folded 67,108,864  = 3.6x
+
+per head:  factored 589,824  vs  folded 2,097,152  = 3.6x
+
+=> both are PER HEAD (there are n_heads of each). Ratio 3.6x holds either way.

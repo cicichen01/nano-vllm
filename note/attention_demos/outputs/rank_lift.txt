@@ -1,0 +1,5 @@
+pre-softmax  QKᵀ  rank = 2  (≤ d_k = 2 )
+post-softmax softmax(QKᵀ) rank = 6  (up to N = 6 )
+
+=> softmax LIFTS a rank-≤d_k score matrix to (near-)full rank N.
+   linear attention keeps QKᵀ as-is: attention stays rank ≤ d_k.

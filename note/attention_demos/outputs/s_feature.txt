@@ -1,0 +1,5 @@
+keys not orthogonal:  k1·k2 = 0.8 
+
+plain  Σkvᵀ:  read k1 -> [1.000 0.800]   read k2 -> [0.800 1.000]   (want [1,0] and [0,1])
+ideal  K⁺V:  read k1 -> [1.000 0.000]   read k2 -> [0.000 1.000]   (want [1,0] and [0,1])
+delta rule:  read k1 -> [0.360 0.800]   read k2 -> [-0.000  1.000]   (want [1,0] and [0,1])

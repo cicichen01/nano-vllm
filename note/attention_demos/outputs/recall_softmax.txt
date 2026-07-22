@@ -1,0 +1,20 @@
+Exp 1  recall vs #items M.   softmax KEEPS ALL M tokens (KV cache, O(M) mem);
+       linear compresses to a fixed S (O(d_k²)).   d_k=d_v=32
+
+   M   plain   delta  softmax(1/√d)  softmax(sharp)
+   4   0.935   0.951          0.539           1.000
+   8   0.894   0.935          0.375           1.000
+  16   0.842   0.842          0.286           1.000
+  32   0.704   0.682          0.205           1.000
+  48   0.621   0.520          0.163           1.000
+  64   0.551   0.419          0.170           1.000
+ 128   0.449   0.261          0.131           1.000
+  sharp = scale 8 ≈ what training achieves (separable keys). Note: softmax stays 1.000
+  even at M=128 » d_k=32 — NO capacity ceiling, because it never compresses.
+
+Exp 2  OVERWRITE: store 20 facts, revise 6 using the SAME key with a new value.
+  plain   : cos(recall,NEW)=+0.556  cos(recall,OLD)=+0.655
+  delta   : cos(recall,NEW)=+0.942  cos(recall,OLD)=+0.039
+  softmax : cos(recall,NEW)=+0.680  cos(recall,OLD)=+0.704
+  identical keys → softmax BLENDS old&new too (only delta ERASES). Real LMs avoid this
+  because position/context make the two keys differ, letting softmax select the latest.

@@ -1,0 +1,39 @@
+
+===== linear attention  (beta=1.0, alpha=1.0) =====
+  after store A→[1,0]    S =
+[[1.000 0.000]
+ [0.000 0.000]]
+  after store B→[0,1]    S =
+[[1.000 0.000]
+ [0.000 1.000]]
+  after UPDATE A→[0,1]   S =
+[[1.000 1.000]
+ [0.000 1.000]]
+  READ A -> [1.000 1.000]      READ B -> [0.000 1.000]
+
+===== DeltaNet  (beta=1.0, alpha=1.0) =====
+  after store A→[1,0]    S =
+[[1.000 0.000]
+ [0.000 0.000]]
+  after store B→[0,1]    S =
+[[1.000 0.000]
+ [0.000 1.000]]
+  after UPDATE A→[0,1]   S =
+[[0.000 1.000]
+ [0.000 1.000]]
+  READ A -> [0.000 1.000]      READ B -> [0.000 1.000]
+
+===== Gated DeltaNet  (beta=1.0, alpha=0.7) =====
+  after store A→[1,0]    S =
+[[1.000 0.000]
+ [0.000 0.000]]
+  after store B→[0,1]    S =
+[[0.700 0.000]
+ [0.000 1.000]]
+  after UPDATE A→[0,1]   S =
+[[0.000 1.000]
+ [0.000 0.700]]
+  READ A -> [0.000 1.000]      READ B -> [0.000 0.700]
+
+Goal after the 3 writes:  READ A should give [0,1] (the updated value),
+                          READ B should give [0,1] (untouched).

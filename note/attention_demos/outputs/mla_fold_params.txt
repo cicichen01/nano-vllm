@@ -1,0 +1,11 @@
+fold exact? True
+
+query projection, per head:
+  factored (W_Q (128, 4096) + W_UK (128, 512)) = 589,824 params
+  folded dense WQ' (512, 4096)            = 2,097,152 params
+  folding INFLATES params by 3.6x
+
+  MACs/token factored = 589,824
+  MACs/token folded   = 2,097,152   (3.6x more)
+
+rank of folded WQ' = 128 (<= head_dim; the dense matrix wastes its extra capacity)

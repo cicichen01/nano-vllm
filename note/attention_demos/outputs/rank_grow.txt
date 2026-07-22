@@ -1,0 +1,14 @@
+d_k = d_v = 4;  add one random token at a time, S += outer(k,v)
+
+ #tokens  rank(S)
+       1        1
+       2        2
+       3        3
+       4        4
+       5        4
+       6        4
+       7        4
+       8        4
+
+collision: two tokens with the SAME key k (different v):
+  rank = 1  (still 1: S = k·(v1+v2)ᵀ)

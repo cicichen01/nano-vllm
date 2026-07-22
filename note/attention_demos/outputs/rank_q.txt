@@ -1,0 +1,9 @@
+Q1  attention-matrix rank (N=8, d_k=3):
+  QKᵀ  unmasked           = 3  (≤ d_k=3)
+  QKᵀ ⊙ causal mask       = 8  <- mask RAISES it
+  softmax(masked QKᵀ)     = 8
+
+Q4  rank of the state S (dk=dv=16, M=40 items):
+  plain  S = Σkvᵀ  rank = 16
+  delta  S         rank = 16
+  -> both already FULL rank d_k; delta does NOT raise rank

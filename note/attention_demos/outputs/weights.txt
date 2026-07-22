@@ -1,0 +1,16 @@
+raw scores  q·kⱼ = [0.600 0.800 1.000]
+
+linear  weights wⱼ = [0.600 0.800 1.000]
+softmax weights wⱼ = [0.269 0.329 0.402]
+
+L (strict-lower key-Gram) =
+ [[0.000 0.000 0.000]
+ [0.000 0.000 0.000]
+ [0.600 0.800 0.000]]
+(I+L)^{-1} =
+ [[ 1.000  0.000  0.000]
+ [ 0.000  1.000  0.000]
+ [-0.600 -0.800  1.000]]
+delta   weights wⱼ = scores @ (I+L)^{-1} = [0.000 0.000 1.000]
+
+-> delta weights subtract the overlapping keys' shares -> clean [0,0,1]
